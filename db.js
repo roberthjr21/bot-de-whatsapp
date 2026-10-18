@@ -37,8 +37,27 @@ db.exec(`
 export function yaProcesado(id) {
   return Boolean(db.prepare('SELECT 1 FROM procesados WHERE id = ?').get(id));
 }
+export function configuracionSQLite() {
+  return {
+    journal_mode: db.prepare('PRAGMA journal_mode').get().journal_mode,
+    busy_timeout: db.prepare('PRAGMA busy_timeout').get().timeout,
+  };
+}
 export function marcarProcesado(id) {
   db.prepare('INSERT OR IGNORE INTO procesados (id) VALUES (?)').run(id);
+}
+// Las acciones de un mensaje y su marca de idempotencia se confirman juntas.
+// Así, un fallo no deja un lote financiero aplicado a medias.
+export function enTransaccion(tarea) {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const resultado = tarea();
+    db.exec('COMMIT');
+    return resultado;
+  } catch (error) {
+    try { db.exec('ROLLBACK'); } catch {}
+    throw error;
+  }
 }
 export function cerrarBase() { db.close(); }
 
@@ -47,8 +66,9 @@ export function cerrarBase() { db.close(); }
 export function agregarMovimiento({ usuario, tipo, monto, categoria, descripcion, fecha, mensajeId }) {
   const r = db
     .prepare(
-      `INSERT OR IGNORE INTO movimientos (usuario, tipo, monto, categoria, descripcion, fecha, mensaje_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO movimientos (usuario, tipo, monto, categoria, descripcion, fecha, mensaje_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (mensaje_id) DO NOTHING`
     )
     .run(usuario, tipo, monto, categoria, descripcion ?? '', fecha, mensajeId ?? null);
   return r.changes === 0 ? null : Number(r.lastInsertRowid);

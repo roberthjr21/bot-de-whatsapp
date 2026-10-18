@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { after } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
+import { Worker } from 'node:worker_threads';
 
 const temporal = fs.mkdtempSync(path.join(os.tmpdir(), 'bot-financiero-test-'));
 process.env.DB_ARCHIVO = path.join(temporal, 'pruebas.db');
@@ -105,6 +106,62 @@ test('registrar movimientos y evitar duplicados', () => {
   assert.match(reg({ tipo: 'transferencia', monto: 100, categoria: 'Otros' }, 0, 'msg9'), /No entendí/);
 });
 
+test('las restricciones financieras rechazan datos inválidos y solo se ignora un mensaje duplicado', () => {
+  assert.equal(db.agregarMovimiento({ usuario: 'restricciones', tipo: 'gasto', monto: 100, categoria: 'Otros', fecha: HOY, mensajeId: 'restriccion-dup' }) !== null, true);
+  assert.equal(db.agregarMovimiento({ usuario: 'restricciones', tipo: 'gasto', monto: 100, categoria: 'Otros', fecha: HOY, mensajeId: 'restriccion-dup' }), null);
+  assert.throws(() => db.agregarMovimiento({ usuario: 'restricciones', tipo: 'transferencia', monto: 100, categoria: 'Otros', fecha: HOY, mensajeId: 'restriccion-tipo' }));
+  assert.throws(() => db.agregarMovimiento({ usuario: 'restricciones', tipo: 'gasto', monto: 0, categoria: 'Otros', fecha: HOY, mensajeId: 'restriccion-monto' }));
+});
+
+test('SQLite crea el esquema, conserva importes enteros y aísla usuarios', () => {
+  assert.deepEqual(db.configuracionSQLite(), { journal_mode: 'wal', busy_timeout: 5000 });
+  const conexion = new DatabaseSync(process.env.DB_ARCHIVO, { readOnly: true });
+  try {
+    assert.equal(conexion.prepare('PRAGMA journal_mode').get().journal_mode, 'wal');
+    const tablas = new Set(conexion.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((r) => r.name));
+    assert.deepEqual([...['movimientos', 'presupuestos', 'procesados'].filter((tabla) => tablas.has(tabla))], ['movimientos', 'presupuestos', 'procesados']);
+  } finally { conexion.close(); }
+
+  const id = db.agregarMovimiento({ usuario: 'cuenta-a', tipo: 'ingreso', monto: 987654, categoria: 'Salario', fecha: HOY, mensajeId: 'aislamiento-a' });
+  assert.ok(id);
+  assert.equal(db.listarMovimientos({ usuario: 'cuenta-a' }).find((m) => m.id === id).monto, 987654);
+  assert.equal(db.listarMovimientos({ usuario: 'cuenta-b' }).some((m) => m.id === id), false);
+  assert.equal(db.resumen('cuenta-b', HOY, HOY).ingresos, 0);
+  db.fijarPresupuesto('cuenta-a', 'Comida', 50000);
+  assert.equal(db.presupuestoDe('cuenta-b', 'Comida'), null);
+  assert.equal(db.borrarMovimiento('cuenta-b', id), null);
+  assert.equal(db.borrarMovimiento('cuenta-a', id).monto, 987654);
+});
+
+test('las acciones y la marca de procesado se revierten juntas ante fallo', () => {
+  assert.throws(() => db.enTransaccion(() => {
+    db.agregarMovimiento({ usuario: 'rollback', tipo: 'gasto', monto: 100, categoria: 'Otros', fecha: HOY, mensajeId: 'rollback:0' });
+    db.marcarProcesado('rollback-msg');
+    throw new Error('fallo simulado');
+  }), /fallo simulado/);
+  assert.deepEqual(db.listarMovimientos({ usuario: 'rollback' }), []);
+  assert.equal(db.yaProcesado('rollback-msg'), false);
+});
+
+test('conexiones concurrentes escriben sin perder filas', async () => {
+  const archivo = path.join(temporal, 'concurrencia.db');
+  const inicial = new DatabaseSync(archivo);
+  inicial.exec('PRAGMA journal_mode=WAL; CREATE TABLE operaciones (id INTEGER PRIMARY KEY, escritor INTEGER NOT NULL, valor INTEGER NOT NULL);');
+  inicial.close();
+  const codigo = `const { parentPort, workerData } = require('node:worker_threads'); const { DatabaseSync } = require('node:sqlite'); const db = new DatabaseSync(workerData.archivo); db.exec('PRAGMA busy_timeout=5000'); const ins = db.prepare('INSERT INTO operaciones(escritor, valor) VALUES (?, ?)'); for (let i=0;i<100;i++) ins.run(workerData.escritor, i); db.close(); parentPort.postMessage('ok');`;
+  await Promise.all(Array.from({ length: 4 }, (_, escritor) => new Promise((resolve, reject) => {
+    const worker = new Worker(codigo, { eval: true, workerData: { archivo, escritor }, execArgv: [] });
+    worker.once('message', resolve);
+    worker.once('error', reject);
+    worker.once('exit', (code) => { if (code !== 0) reject(new Error(`worker terminó con código ${code}`)); });
+  })));
+  const verificacion = new DatabaseSync(archivo, { readOnly: true });
+  try {
+    assert.equal(verificacion.prepare('SELECT count(*) AS total FROM operaciones').get().total, 400);
+    assert.equal(verificacion.prepare('PRAGMA integrity_check').get().integrity_check, 'ok');
+  } finally { verificacion.close(); }
+});
+
 test('resumen del periodo y por categoría', () => {
   const texto = ejecutar({ nombre: 'consultar_resumen', datos: { periodo: 'mes' } }, { usuario: U, hoy: HOY });
   assert.match(texto, /Ingresos: \$1\.500\.000/);
@@ -139,9 +196,9 @@ test('respaldo y restauración conservan datos en WAL sin sobrescribir', () => {
   const respaldo = path.join(temporal, 'respaldo.db');
   const restaurada = path.join(temporal, 'restaurada.db');
   const origenDb = new DatabaseSync(origen);
-  origenDb.exec('PRAGMA journal_mode=WAL; CREATE TABLE movimientos (id INTEGER PRIMARY KEY, monto INTEGER); CREATE TABLE presupuestos (id INTEGER); CREATE TABLE procesados (id INTEGER);');
-  const insertar = origenDb.prepare('INSERT INTO movimientos (monto) VALUES (?)');
-  for (let i = 1; i <= 100; i++) insertar.run(i);
+  origenDb.exec("PRAGMA journal_mode=WAL; CREATE TABLE movimientos (id INTEGER PRIMARY KEY AUTOINCREMENT, usuario TEXT NOT NULL, tipo TEXT NOT NULL CHECK(tipo IN ('gasto','ingreso')), monto INTEGER NOT NULL CHECK(monto > 0), categoria TEXT NOT NULL, descripcion TEXT NOT NULL DEFAULT '', fecha TEXT NOT NULL, creado TEXT NOT NULL DEFAULT (datetime('now')), mensaje_id TEXT UNIQUE); CREATE TABLE presupuestos (usuario TEXT NOT NULL, categoria TEXT NOT NULL, limite INTEGER NOT NULL CHECK(limite > 0), PRIMARY KEY(usuario,categoria)); CREATE TABLE procesados (id TEXT PRIMARY KEY, creado TEXT NOT NULL DEFAULT (datetime('now')));");
+  const insertar = origenDb.prepare('INSERT INTO movimientos (usuario, tipo, monto, categoria, fecha) VALUES (?, ?, ?, ?, ?)');
+  for (let i = 1; i <= 100; i++) insertar.run('prueba', 'gasto', i, 'Otros', '2026-01-01');
   assert.throws(() => restaurarRespaldo(origen, path.join(temporal, 'restauracion-insegura.db')), /WAL\/SHM/);
   crearRespaldo(origen, respaldo);
   origenDb.close();
@@ -149,7 +206,50 @@ test('respaldo y restauración conservan datos en WAL sin sobrescribir', () => {
   const restauradaDb = new DatabaseSync(restaurada, { readOnly: true });
   assert.equal(restauradaDb.prepare('SELECT count(*) AS n FROM movimientos').get().n, 100);
   restauradaDb.close();
+  const restauradaReabierta = new DatabaseSync(restaurada, { readOnly: true });
+  assert.equal(restauradaReabierta.prepare('SELECT count(*) AS n FROM movimientos').get().n, 100);
+  restauradaReabierta.close();
+  const integridadDb = new DatabaseSync(restaurada, { readOnly: true });
+  assert.equal(integridadDb.prepare('PRAGMA integrity_check').get().integrity_check, 'ok');
+  integridadDb.close();
   assert.throws(() => restaurarRespaldo(respaldo, restaurada), /ya existe/);
+});
+
+test('respaldo y restauración rechazan archivos corruptos y limpian ante errores de permiso', () => {
+  const corrupta = path.join(temporal, 'corrupta.db');
+  const destino = path.join(temporal, 'corrupta-restaurada.db');
+  fs.writeFileSync(corrupta, 'esto no es una base SQLite');
+  assert.throws(() => crearRespaldo(corrupta, path.join(temporal, 'respaldo-corrupto.db')));
+  assert.throws(() => restaurarRespaldo(corrupta, destino));
+  const incompatible = path.join(temporal, 'esquema-incompatible.db');
+  const incompatibleDb = new DatabaseSync(incompatible);
+  incompatibleDb.exec('CREATE TABLE movimientos (id INTEGER); CREATE TABLE presupuestos (id INTEGER); CREATE TABLE procesados (id INTEGER);');
+  incompatibleDb.close();
+  assert.throws(() => restaurarRespaldo(incompatible, path.join(temporal, 'incompatible-restaurada.db')), /Esquema incompatible/);
+  const respaldoDenegado = path.join(temporal, 'respaldo-denegado.db');
+  const restauracionDenegada = path.join(temporal, 'restauracion-denegada.db');
+  const fuenteIndependiente = path.join(temporal, 'fuente-independiente.db');
+  const fuenteDb = new DatabaseSync(fuenteIndependiente);
+  fuenteDb.exec("CREATE TABLE movimientos (id INTEGER PRIMARY KEY AUTOINCREMENT, usuario TEXT NOT NULL, tipo TEXT NOT NULL CHECK(tipo IN ('gasto','ingreso')), monto INTEGER NOT NULL CHECK(monto > 0), categoria TEXT NOT NULL, descripcion TEXT NOT NULL DEFAULT '', fecha TEXT NOT NULL, creado TEXT NOT NULL DEFAULT (datetime('now')), mensaje_id TEXT UNIQUE); CREATE TABLE presupuestos (usuario TEXT NOT NULL, categoria TEXT NOT NULL, limite INTEGER NOT NULL CHECK(limite > 0), PRIMARY KEY(usuario,categoria)); CREATE TABLE procesados (id TEXT PRIMARY KEY, creado TEXT NOT NULL DEFAULT (datetime('now')));");
+  fuenteDb.close();
+  const linkOriginal = fs.linkSync;
+  fs.linkSync = () => { const error = new Error('permiso denegado simulado'); error.code = 'EACCES'; throw error; };
+  try {
+    assert.throws(() => crearRespaldo(process.env.DB_ARCHIVO, respaldoDenegado), { code: 'EACCES' });
+    assert.throws(() => restaurarRespaldo(fuenteIndependiente, restauracionDenegada), { code: 'EACCES' });
+  } finally { fs.linkSync = linkOriginal; }
+  assert.equal(fs.existsSync(respaldoDenegado), false);
+  assert.equal(fs.existsSync(restauracionDenegada), false);
+});
+
+test('restauración conserva datos al cerrar y volver a abrir SQLite', () => {
+  const archivo = path.join(temporal, 'persistencia.db');
+  const primera = new DatabaseSync(archivo);
+  primera.exec('CREATE TABLE prueba (valor INTEGER NOT NULL); INSERT INTO prueba VALUES (42);');
+  primera.close();
+  const segunda = new DatabaseSync(archivo, { readOnly: true });
+  try { assert.equal(segunda.prepare('SELECT valor FROM prueba').get().valor, 42); }
+  finally { segunda.close(); }
 });
 
 test('los datos de cada persona están separados', () => {
@@ -243,6 +343,7 @@ test('API para la página: token, resumen, movimientos y presupuestos', async ()
   const resumen = solicitar('/api/resumen?mes=2026-10', con).json;
   assert.equal(resumen.ingresos, 1500000);
   assert.ok(resumen.gastos > 0 && Array.isArray(resumen.porCategoria));
+  assert.deepEqual(solicitar('/api/resumen?mes=2026-10&usuario=otra-persona', con).json, resumen);
 
   const movs = solicitar('/api/movimientos?tipo=gasto&categoria=Ocio', con).json;
   assert.ok(movs.length >= 2 && movs.every((m) => m.categoria === 'Ocio' && m.tipo === 'gasto'));

@@ -1,4 +1,5 @@
 import { CATEGORIAS } from './categorias.js';
+import { montoMaximo } from './montos.js';
  
 // Proveedor de IA: Gemini si hay GEMINI_API_KEY; si no, Claude si hay ANTHROPIC_API_KEY.
 // MODELO_GEMINI / MODELO_ANTHROPIC eligen cada proveedor; MODELO_IA queda como compatibilidad.
@@ -18,7 +19,7 @@ const HERRAMIENTAS = [
       'Registra UN gasto o ingreso. Si la persona cuenta varios, llama a esta herramienta una vez por cada uno.',
     propiedades: {
       tipo: { type: 'string', enum: ['gasto', 'ingreso'] },
-      monto: { type: 'integer', minimum: 1, maximum: 100000000, description: 'Monto en pesos colombianos, entero.' },
+      monto: { type: 'integer', minimum: 1, description: 'Monto en pesos colombianos, entero.' },
       categoria: { type: 'string', enum: CATEGORIAS },
       descripcion: { type: 'string', description: 'Descripción muy corta (2 a 5 palabras).' },
       fecha: { type: 'string', description: 'AAAA-MM-DD. Solo si la persona indicó una fecha distinta de hoy.' },
@@ -48,7 +49,7 @@ const HERRAMIENTAS = [
     descripcion: 'Fija un límite mensual de gasto para una categoría.',
     propiedades: {
       categoria: { type: 'string', enum: CATEGORIAS },
-      limite_mensual: { type: 'integer', minimum: 1, maximum: 100000000, description: 'Límite mensual entero en COP.' },
+      limite_mensual: { type: 'integer', minimum: 1, description: 'Límite mensual entero en COP.' },
     },
     requeridas: ['categoria', 'limite_mensual'],
   },
@@ -60,7 +61,12 @@ const HERRAMIENTAS = [
  
 const esquema = (h) => ({
   type: 'object',
-  properties: h.propiedades,
+  properties: h.propiedades && Object.fromEntries(Object.entries(h.propiedades).map(([nombre, propiedad]) => [
+    nombre,
+    ['monto', 'limite_mensual'].includes(nombre)
+      ? { ...propiedad, maximum: montoMaximo() }
+      : propiedad,
+  ])),
   ...(h.requeridas ? { required: h.requeridas } : {}),
 });
 

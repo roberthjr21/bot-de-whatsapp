@@ -1,0 +1,68 @@
+INFORME DE AUDITORIA SQLITE — BOT FINANCIERO
+
+Fecha: 2026-10-18
+Proyecto: /home/roberth/bot-financiero
+
+RESUMEN
+
+Se revisaron db.js, db-admin.js, bot.js, acciones.js, api.js, bot.test.js y otros archivos relacionados con SQLite. Las pruebas usaron exclusivamente bases de datos temporales. No se abrió ni modificó la base de datos real, no se leyó .env, y no se hicieron commits, pushes ni despliegues.
+
+DIAGNOSTICO
+
+Prioridad alta:
+- Un mensaje podía aplicar algunas acciones financieras, fallar en otra y aun así marcarse como procesado. Esto podía dejar cambios parciales y evitar el reintento.
+- El cierre podía cerrar SQLite mientras quedaban mensajes en la cola.
+- El respaldo hacía un checkpoint sin comprobar su resultado y podía dejar un archivo parcial si fallaba.
+- INSERT OR IGNORE podía ocultar restricciones fallidas además de un duplicado de mensaje.
+
+Prioridad media:
+- WAL y busy_timeout=5000 están configurados en la conexión principal.
+- Las tablas son movimientos, presupuestos y procesados. No hay tabla separada de usuarios; cada movimiento y presupuesto guarda el identificador del usuario.
+- Las consultas usan parámetros. Los fragmentos dinámicos son condiciones SQL fijas del programa.
+- Los importes se guardan como INTEGER y la aplicación exige enteros positivos. El esquema también impone restricciones de tipo, monto y unicidad.
+- La API usa el usuario predeterminado y no permite seleccionar otro con el parámetro ?usuario=.
+- La restauración ya validaba integridad y tablas, pero no las columnas y tipos esperados.
+
+CAMBIOS REALIZADOS
+
+- db.js: se agregó enTransaccion para confirmar o revertir como unidad las acciones del mensaje y su marca de procesado. Se agregó configuracionSQLite para consultar el modo journal y busy_timeout efectivos.
+- db.js: el alta ahora ignora únicamente el conflicto de mensaje_id; otras violaciones de CHECK/NOT NULL llegan al llamador.
+- bot.js: las acciones y la marca de procesado de mensajes con texto se ejecutan en una transacción; los multimedia usan la misma idempotencia. El cierre espera autorizaciones ya iniciadas y luego drena la cola antes de cerrar SQLite.
+- db-admin.js: el respaldo crea un temporal con VACUUM INTO, valida integridad y esquema y lo publica con un enlace atómico que falla si el destino ya existe. La validación examina todas las filas de integrity_check, y se configura busy_timeout en las conexiones de administración.
+- bot.test.js: se cubren creación del esquema, movimientos, restricciones, WAL y timeout, aislamiento por usuario, rollback, concurrencia con cuatro conexiones, respaldo/restauración con WAL, integridad, archivos corruptos, esquema incompatible, errores EACCES simulados y persistencia al reabrir.
+
+PRUEBAS
+
+- node bot.test.js: 19 pruebas pasaron.
+- npm test: pasó.
+- node --check bot.js y node --check db-admin.js: pasaron.
+- git diff --check: pasó.
+- Los archivos de prueba se crearon en directorios temporales y se eliminaron al finalizar.
+- El error EACCES se simuló para comprobar que se comunica y que no queda un destino parcial. No se alteraron permisos reales.
+
+CIERRE, WAL Y RECUPERACION
+
+El cierre normal cierra la conexión después de drenar la cola. SQLite puede hacer checkpoint al cerrar la última conexión; WAL también permite recuperar transacciones tras reinicios inesperados. No se fuerza un checkpoint antes de cada respaldo: VACUUM INTO captura un snapshot coherente incluso con WAL activo. No se probó una pérdida eléctrica real.
+
+RIESGOS PENDIENTES
+
+- La separación por usuario es lógica de aplicación; quien tenga acceso al archivo SQLite o al servidor puede leer los datos.
+- La prueba de EACCES es simulada, no una prueba con ACL reales del sistema operativo.
+- Las pruebas no cubren fallos de hardware, almacenamiento ni todas las condiciones de un apagado abrupto.
+- No hay copias periódicas configuradas.
+
+RECOMENDACIONES
+
+- Protege el directorio de la base y los respaldos con permisos del sistema operativo; cifra las copias que salgan del equipo.
+- Programa un respaldo diario con db-admin.js, conserva por ejemplo 30 copias diarias y guarda una copia cifrada fuera del equipo.
+- Prueba una restauración mensual en una ruta temporal nueva; nunca sobrescribas la base activa para probar.
+- Considera un checkpoint explícito solo para mantenimiento y revisa su resultado.
+
+ARCHIVOS MODIFICADOS
+
+- bot.js
+- bot.test.js
+- db-admin.js
+- db.js
+
+No se hicieron commits, pushes ni despliegues. No se debe afirmar que SQLite está completamente protegido: las pruebas cubren los escenarios indicados, no todas las posibles fallas externas.

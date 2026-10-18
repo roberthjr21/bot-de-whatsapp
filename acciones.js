@@ -29,8 +29,9 @@ function linea(m) {
 }
 
 // Ejecuta una acción y devuelve el texto a responder (o null si no hay nada que decir)
-export function ejecutar(accion, { usuario, hoy, mensajeId, indice }) {
+export function ejecutar(accion, { usuario, hoy, mensajeId, indice, efectos }) {
   const datos = accion.datos ?? {};
+  const diferir = (efecto) => efectos ? efectos.push(efecto) : efecto();
 
   switch (accion.nombre) {
     case 'registrar_movimiento': {
@@ -92,20 +93,21 @@ export function ejecutar(accion, { usuario, hoy, mensajeId, indice }) {
     case 'deshacer_ultimo': {
       const fila = db.ultimoMovimientoBorrable(usuario);
       if (!fila) return 'No hay movimientos recientes para deshacer.';
-      confirmacionesBorrado.set(usuario, { id: fila.id, vence: Date.now() + CONFIRMACION_MS });
+      diferir(() => confirmacionesBorrado.set(usuario, { id: fila.id, vence: Date.now() + CONFIRMACION_MS }));
       return `⚠️ ¿Confirmas borrar este movimiento?\n${linea(fila)}\nResponde /deshacer confirmar. Para cancelar: /deshacer cancelar.`;
     }
 
     case 'confirmar_deshacer': {
       const pendiente = confirmacionesBorrado.get(usuario);
-      confirmacionesBorrado.delete(usuario);
+      diferir(() => confirmacionesBorrado.delete(usuario));
       if (!pendiente || pendiente.vence < Date.now()) return 'No hay un borrado pendiente. Escribe /deshacer para iniciar uno.';
       const fila = db.borrarMovimiento(usuario, pendiente.id);
       return fila ? `↩️ Borré el movimiento confirmado:\n${linea(fila)}` : 'El movimiento cambió o ya no está disponible; no borré nada.';
     }
 
     case 'cancelar_deshacer': {
-      const existia = confirmacionesBorrado.delete(usuario);
+      const existia = confirmacionesBorrado.has(usuario);
+      diferir(() => confirmacionesBorrado.delete(usuario));
       return existia ? 'Listo, cancelé el borrado.' : 'No hay un borrado pendiente.';
     }
 

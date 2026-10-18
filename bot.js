@@ -308,24 +308,27 @@ async function atender(sock, jid, msg, usuario, texto) {
   }
 
   const acotadas = acotarAcciones(acciones);
-  acotadas.forEach((accion, indice) => {
-    try {
-      const r = ejecutar(accion, { usuario, hoy, mensajeId: id, indice });
-      if (r) respuestas.push(r);
-    } catch (error) {
-      console.error('No se pudo completar una acción financiera:', error.message);
-      respuestas.push('⚠️ No pude completar una acción financiera. Revisa el estado antes de repetirla.');
-    }
-  });
-  if (acotadas.length < acciones.length) {
-    respuestas.push('⚠️ Procesé solo las primeras 5 acciones de este mensaje.');
-  }
-
+  const efectos = [];
   try {
-    db.marcarProcesado(id);
+    const procesado = db.enTransaccion(() => {
+      // Revisa dentro del bloqueo de escritura para cubrir dos instancias del bot.
+      if (db.yaProcesado(id)) return false;
+      acotadas.forEach((accion, indice) => {
+        const r = ejecutar(accion, { usuario, hoy, mensajeId: id, indice, efectos });
+        if (r) respuestas.push(r);
+      });
+      if (acotadas.length < acciones.length) {
+        respuestas.push('⚠️ Procesé solo las primeras 5 acciones de este mensaje.');
+      }
+      db.marcarProcesado(id);
+      return true;
+    });
+    if (!procesado) return;
+    efectos.forEach((efecto) => efecto());
   } catch (error) {
-    console.error('No se pudo marcar el mensaje como procesado:', error.message);
-    respuestas.push('⚠️ No pude confirmar el procesamiento del mensaje. Revisa los movimientos antes de reenviarlo.');
+    console.error('No se pudo completar el mensaje de forma atómica:', error.message);
+    respuestas.length = 0;
+    respuestas.push('⚠️ No pude completar este mensaje; no guardé cambios parciales. Puedes volver a intentarlo.');
   }
 
   if (respuestas.length === 0) {
@@ -349,9 +352,12 @@ async function atender(sock, jid, msg, usuario, texto) {
 // ==========================================
 
 async function responderSinTexto(sock, jid, msg) {
-  if (db.yaProcesado(msg.key.id)) return;
-
-  db.marcarProcesado(msg.key.id);
+  const procesado = db.enTransaccion(() => {
+    if (db.yaProcesado(msg.key.id)) return false;
+    db.marcarProcesado(msg.key.id);
+    return true;
+  });
+  if (!procesado) return;
 
   await enviarTexto(
     sock,
@@ -370,6 +376,7 @@ async function responderSinTexto(sock, jid, msg) {
 let reconectando = false;
 let cerrando = false;
 let socketActivo = null;
+let autorizacionesEnCurso = 0;
 
 function reconectar(motivo) {
   if (reconectando || cerrando) return;
@@ -463,6 +470,7 @@ async function iniciar() {
   sock.ev.on(
     'messages.upsert',
     async ({ messages, type }) => {
+      if (cerrando) return;
       if (DEBUG) {
         console.log(
           `[debug] messages.upsert tipo=${type} cantidad=${messages.length}`
@@ -516,7 +524,15 @@ async function iniciar() {
           }
         } else {
           // Verificar autorización antes de procesar el mensaje.
-          usuario = await usuarioPermitido(sock, msg);
+          autorizacionesEnCurso++;
+          try {
+            usuario = await usuarioPermitido(sock, msg);
+          } finally {
+            autorizacionesEnCurso--;
+          }
+
+          // El cierre pudo empezar mientras se resolvía el identificador.
+          if (cerrando) return;
 
           if (!usuario) {
             remitentesNoAutorizados++;
@@ -610,6 +626,13 @@ async function apagar(signal) {
   cerrando = true;
   console.log(`Cierre solicitado (${signal}); guardando y cerrando SQLite.`);
   try { socketActivo?.end(new Error('Cierre solicitado')); } catch {}
+  // Eventos que ya estaban resolviendo la identidad pueden encolar trabajo
+  // después de que el socket se cierre.
+  while (autorizacionesEnCurso > 0) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  // Deja que termine el trabajo ya encolado antes de cerrar la conexión SQLite.
+  await cola;
   if (servidorApi?.listening) {
     await new Promise((resolve) => servidorApi.close(resolve));
   }
