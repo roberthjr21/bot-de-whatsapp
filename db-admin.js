@@ -17,6 +17,7 @@ function validarBase(archivo) {
       movimientos: {
         columnas: { id: 'INTEGER', usuario: 'TEXT', tipo: 'TEXT', monto: 'INTEGER', categoria: 'TEXT', descripcion: 'TEXT', fecha: 'TEXT', creado: 'TEXT', mensaje_id: 'TEXT' },
         pk: { id: 1 },
+        nullable: ['mensaje_id'],
         restricciones: ["CHECK (tipo IN ('gasto', 'ingreso'))", 'CHECK (monto > 0)', 'UNIQUE'],
       },
       presupuestos: {
@@ -35,17 +36,17 @@ function validarBase(archivo) {
         if (!fila || fila.type.toUpperCase() !== tipo) {
           throw new Error(`Esquema incompatible en ${tabla}.${columna}; se esperaba ${tipo}.`);
         }
-        if (definicion.pk[columna] !== (fila.pk || 0)) {
-          throw new Error(`Clave primaria incompatible en ${tabla}.${columna}.`);
+        if ((definicion.pk[columna] ?? 0) !== (fila.pk || 0)) {
+          throw new Error(`Esquema incompatible: clave primaria incorrecta en ${tabla}.${columna}.`);
         }
-        if (!definicion.pk[columna] && fila.notnull !== 1) {
+        if (!definicion.pk[columna] && !definicion.nullable?.includes(columna) && fila.notnull !== 1) {
           throw new Error(`La columna ${tabla}.${columna} debe ser NOT NULL.`);
         }
       }
       const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(tabla)?.sql ?? '';
-      const normalizado = sql.toUpperCase().replace(/[\"`\[\]]/g, '').replace(/\s+/g, ' ');
+      const normalizado = sql.toUpperCase().replace(/[\"`\[\]]/g, '').replace(/\s+/g, '');
       for (const restriccion of definicion.restricciones) {
-        if (!normalizado.includes(restriccion.toUpperCase())) {
+        if (!normalizado.includes(restriccion.toUpperCase().replace(/\s+/g, ''))) {
           throw new Error(`Falta la restricción esperada en ${tabla}: ${restriccion}.`);
         }
       }
