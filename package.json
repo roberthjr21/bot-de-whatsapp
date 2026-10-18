@@ -1,0 +1,19 @@
+{
+  "name": "bot-financiero",
+  "version": "1.0.0",
+  "description": "Ayudante financiero personal por WhatsApp",
+  "type": "module",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node --env-file=.env bot.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
+    "pino": "^10.4.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
