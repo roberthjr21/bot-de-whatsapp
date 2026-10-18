@@ -1,4 +1,5 @@
 import { buscarCategoria, normalizar } from './categorias.js';
+import { parseMonto } from './montos.js';
 
 export const AYUDA = [
   '🤖 *Tu ayudante financiero*',
@@ -18,16 +19,6 @@ export const AYUDA = [
   '/presupuesto comida 300000',
   '/presupuestos',
 ].join('\n');
-
-// "20000", "$20.000", "20k", "20mil" -> 20000
-function parseMonto(texto) {
-  const m = String(texto ?? '').toLowerCase().match(/^\$?([\d.,]+)(k|mil|lucas)?$/);
-  if (!m) return null;
-  let n = parseInt(m[1].replace(/[.,]/g, ''), 10);
-  if (!Number.isFinite(n) || n <= 0) return null;
-  if (m[2]) n *= 1000;
-  return n;
-}
 
 const PERIODOS = {
   hoy: 'hoy',
@@ -50,10 +41,14 @@ export function interpretarComando(texto) {
 
     case 'gasto':
     case 'ingreso': {
-      const monto = parseMonto(resto[0]);
+      const cantidad = resto[0] && /^(mil|lucas|k|millones?|millón|millon)$/iu.test(resto[1] ?? '')
+        ? `${resto[0]} ${resto[1]}`
+        : resto[0];
+      const desplazamiento = cantidad === `${resto[0]} ${resto[1]}` ? 2 : 1;
+      const monto = parseMonto(cantidad);
       if (!monto) return { respuesta: `Usa: /${comando} 20000 comida almuerzo` };
-      const categoria = buscarCategoria(resto[1] ?? '');
-      const descripcion = (categoria ? resto.slice(2) : resto.slice(1)).join(' ');
+      const categoria = buscarCategoria(resto[desplazamiento] ?? '');
+      const descripcion = (categoria ? resto.slice(desplazamiento + 1) : resto.slice(desplazamiento)).join(' ');
       return {
         acciones: [
           {
@@ -74,11 +69,20 @@ export function interpretarComando(texto) {
       return { acciones: [{ nombre: 'ultimos_movimientos', datos: { cantidad: Number(resto[0]) || 5 } }] };
 
     case 'deshacer':
+      if (normalizar(resto[0] ?? '') === 'confirmar') {
+        return { acciones: [{ nombre: 'confirmar_deshacer', datos: {} }] };
+      }
+      if (normalizar(resto[0] ?? '') === 'cancelar') {
+        return { acciones: [{ nombre: 'cancelar_deshacer', datos: {} }] };
+      }
       return { acciones: [{ nombre: 'deshacer_ultimo', datos: {} }] };
 
     case 'presupuesto': {
       const categoria = buscarCategoria(resto[0] ?? '');
-      const limite = parseMonto(resto[1]);
+      const segundo = resto[1] && /^(mil|lucas|k|millones?|millón|millon)$/iu.test(resto[2] ?? '')
+        ? `${resto[1]} ${resto[2]}`
+        : resto[1];
+      const limite = parseMonto(segundo);
       if (!categoria || !limite) return { respuesta: 'Usa: /presupuesto comida 300000' };
       return { acciones: [{ nombre: 'fijar_presupuesto', datos: { categoria, limite_mensual: limite } }] };
     }

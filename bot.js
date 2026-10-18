@@ -15,6 +15,8 @@ import { hayIA, interpretar, nombreProveedor } from './ia.js';
 import { interpretarComando } from './comandos.js';
 import { ejecutar } from './acciones.js';
 import { iniciarApi } from './api.js';
+import { acotarAcciones } from './politicas.js';
+import { tieneDecimalConPunto } from './montos.js';
 
 // ==========================================
 // CONFIGURACIÓN
@@ -47,6 +49,7 @@ const TIPOS_MEDIA = new Set([
 ]);
 
 const enviadosPorBot = new Set();
+let remitentesNoAutorizados = 0;
 
 // ==========================================
 // COLA DE MENSAJES
@@ -164,20 +167,13 @@ async function usuarioPermitido(sock, msg) {
         const numero = soloNumero(pn);
 
         if (PERMITIDOS.includes(numero)) {
-          if (DEBUG) {
-            console.log(
-              `[debug] LID resuelto para un número autorizado: ${numero}`
-            );
-          }
+          if (DEBUG) console.log('[debug] Identidad autorizada resuelta mediante LID.');
 
           return numero;
         }
       } catch (error) {
         if (DEBUG) {
-          console.warn(
-            'No se pudo resolver el LID:',
-            error?.message ?? 'error desconocido'
-          );
+          console.warn('No se pudo resolver una identidad LID autorizada.');
         }
       }
     }
@@ -243,7 +239,13 @@ async function enviarTexto(sock, jid, texto, citado) {
 async function atender(sock, jid, msg, usuario, texto) {
   const id = msg.key.id;
 
-  if (db.yaProcesado(id)) return;
+  try {
+    if (db.yaProcesado(id)) return;
+  } catch (error) {
+    console.error('No se pudo consultar el estado del mensaje:', error.message);
+    await enviarTexto(sock, jid, '⚠️ La base de datos no está disponible. No repetí ni registré el movimiento.', msg);
+    return;
+  }
 
   const ts = segundos(msg.messageTimestamp);
 
@@ -295,18 +297,36 @@ async function atender(sock, jid, msg, usuario, texto) {
     );
   }
 
-  acciones.forEach((accion, indice) => {
-    const r = ejecutar(accion, {
-      usuario,
-      hoy,
-      mensajeId: id,
-      indice,
-    });
+  if (
+    !texto.startsWith('/') &&
+    tieneDecimalConPunto(texto) &&
+    Array.isArray(acciones) &&
+    acciones.some((accion) => ['registrar_movimiento', 'fijar_presupuesto'].includes(accion?.nombre))
+  ) {
+    acciones = [];
+    respuestas.push('⚠️ No pude interpretar el punto decimal con seguridad. Usa coma para decimales y punto solo para grupos de miles, por ejemplo 20.500.');
+  }
 
-    if (r) respuestas.push(r);
+  const acotadas = acotarAcciones(acciones);
+  acotadas.forEach((accion, indice) => {
+    try {
+      const r = ejecutar(accion, { usuario, hoy, mensajeId: id, indice });
+      if (r) respuestas.push(r);
+    } catch (error) {
+      console.error('No se pudo completar una acción financiera:', error.message);
+      respuestas.push('⚠️ No pude completar una acción financiera. Revisa el estado antes de repetirla.');
+    }
   });
+  if (acotadas.length < acciones.length) {
+    respuestas.push('⚠️ Procesé solo las primeras 5 acciones de este mensaje.');
+  }
 
-  db.marcarProcesado(id);
+  try {
+    db.marcarProcesado(id);
+  } catch (error) {
+    console.error('No se pudo marcar el mensaje como procesado:', error.message);
+    respuestas.push('⚠️ No pude confirmar el procesamiento del mensaje. Revisa los movimientos antes de reenviarlo.');
+  }
 
   if (respuestas.length === 0) {
     respuestas.push(
@@ -348,9 +368,11 @@ async function responderSinTexto(sock, jid, msg) {
 // ==========================================
 
 let reconectando = false;
+let cerrando = false;
+let socketActivo = null;
 
 function reconectar(motivo) {
-  if (reconectando) return;
+  if (reconectando || cerrando) return;
 
   reconectando = true;
 
@@ -382,6 +404,7 @@ async function iniciar() {
     auth: state,
     logger: pino({ level: 'silent' }),
   });
+  socketActivo = sock;
 
   sock.ev.on('creds.update', saveCreds);
 
@@ -397,10 +420,7 @@ async function iniciar() {
       }
 
       if (connection === 'open') {
-        console.log(
-          '✅ Bot financiero conectado (número del bot: ' +
-          `${numerosPropios(sock).join(' / ') || 'desconocido'})`
-        );
+        console.log('✅ Bot financiero conectado.');
       }
 
       if (connection === 'close') {
@@ -411,6 +431,10 @@ async function iniciar() {
           console.log(
             'Sesión cerrada. Borra la carpeta "auth" y vuelve a iniciar el bot.'
           );
+          void apagar('sesión cerrada').then(() => {
+            process.exitCode = 2;
+            process.exit(2);
+          });
         } else if (
           codigo === DisconnectReason.connectionReplaced
         ) {
@@ -419,7 +443,10 @@ async function iniciar() {
             'Ciérrala con ayuda de: pgrep -af bot.js'
           );
 
-          process.exit(1);
+          void apagar('sesión reemplazada').then(() => {
+            process.exitCode = 2;
+            process.exit(2);
+          });
         } else {
           reconectar(
             `Conexión perdida (código ${codigo ?? 'desconocido'}).`
@@ -474,9 +501,7 @@ async function iniciar() {
           // Solo permite utilizar el chat propio si está activado.
           if (!AUTOCHAT || !esChatPropio(sock, jid)) {
             if (DEBUG) {
-              console.log(
-                `[debug] Mensaje propio ignorado (chat ${jid})`
-              );
+              console.log('[debug] Mensaje propio ignorado por configuración.');
             }
 
             continue;
@@ -485,10 +510,7 @@ async function iniciar() {
           usuario = usuarioPropio(sock);
 
           if (!usuario) {
-            console.log(
-              'Tu propio número no está en NUMEROS_PERMITIDOS. ' +
-              'Agrégalo para usar el chat contigo mismo.'
-            );
+            console.log('El número del chat propio no está en NUMEROS_PERMITIDOS.');
 
             continue;
           }
@@ -497,11 +519,9 @@ async function iniciar() {
           usuario = await usuarioPermitido(sock, msg);
 
           if (!usuario) {
-            if (DEBUG) {
-              console.log(
-                `[debug] Mensaje ignorado: no se pudo verificar ` +
-                `un número autorizado (${jid}).`
-              );
+            remitentesNoAutorizados++;
+            if (remitentesNoAutorizados === 1 || remitentesNoAutorizados % 10 === 0) {
+              console.warn(`Mensajes no autorizados ignorados: ${remitentesNoAutorizados}.`);
             }
 
             continue;
@@ -509,10 +529,7 @@ async function iniciar() {
         }
 
         if (DEBUG) {
-          console.log(
-            `[debug] Mensaje autorizado de ${jid} ` +
-            `(tipo ${tipoDe(msg)})`
-          );
+          console.log(`[debug] Mensaje autorizado (tipo ${tipoDe(msg)}).`);
         }
 
         const ts = segundos(msg.messageTimestamp);
@@ -528,9 +545,7 @@ async function iniciar() {
         if (!texto) {
           const tipo = tipoDe(msg);
 
-          console.log(
-            `Mensaje sin texto (${tipo}) de ${jid}.`
-          );
+            console.log(`Mensaje sin texto (${tipo}) ignorado.`);
 
           if (TIPOS_MEDIA.has(tipo)) {
             encolar(() =>
@@ -560,7 +575,7 @@ if (PERMITIDOS.length === 0) {
   );
 } else {
   console.log(
-    `Números autorizados: ${PERMITIDOS.join(', ')}` +
+    `Números autorizados configurados: ${PERMITIDOS.length}` +
     `${AUTOCHAT ? ' (modo chat contigo mismo activado)' : ''}`
   );
 }
@@ -575,7 +590,7 @@ if (PERMITIDOS.includes('573001234567')) {
 if (hayIA()) {
   console.log(
     `IA: ${nombreProveedor()} ` +
-    `(modelo: ${process.env.MODELO_IA ?? 'por defecto'})`
+    `(modelo: ${process.env.MODELO_GEMINI ?? process.env.MODELO_ANTHROPIC ?? process.env.MODELO_IA ?? 'por defecto'})`
   );
 } else {
   console.warn(
@@ -588,9 +603,29 @@ if (hayIA()) {
 // INICIAR SERVICIOS
 // ==========================================
 
-iniciarApi(PERMITIDOS[0]);
+const servidorApi = iniciarApi(PERMITIDOS[0]);
+
+async function apagar(signal) {
+  if (cerrando) return;
+  cerrando = true;
+  console.log(`Cierre solicitado (${signal}); guardando y cerrando SQLite.`);
+  try { socketActivo?.end(new Error('Cierre solicitado')); } catch {}
+  if (servidorApi?.listening) {
+    await new Promise((resolve) => servidorApi.close(resolve));
+  }
+  try { db.cerrarBase(); } catch (error) {
+    console.error('No se pudo cerrar SQLite limpiamente:', error.message);
+    process.exitCode = 1;
+  }
+}
+
+process.once('SIGINT', () => { void apagar('SIGINT'); });
+process.once('SIGTERM', () => { void apagar('SIGTERM'); });
 
 iniciar().catch((e) => {
   console.error('No se pudo iniciar el bot:', e);
-  process.exit(1);
+  void apagar('error al iniciar').then(() => {
+    process.exitCode = 1;
+    process.exit(1);
+  });
 });

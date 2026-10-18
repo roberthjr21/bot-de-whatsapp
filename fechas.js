@@ -25,6 +25,9 @@ export function valida(iso) {
 
 // Primer y último día de un mes "AAAA-MM"
 export function rangoMes(mes) {
+  if (typeof mes !== 'string' || !/^\d{4}-(0[1-9]|1[0-2])$/.test(mes) || Number(mes.slice(0, 4)) < 1000) {
+    throw new RangeError('Mes fuera de rango. Usa un año entre 1000 y 9999.');
+  }
   const [a, m] = mes.split('-').map(Number);
   const desde = `${a}-${dos(m)}-01`;
   const hasta = aIso(new Date(Date.UTC(a, m, 0))); // día 0 del mes siguiente = último del actual

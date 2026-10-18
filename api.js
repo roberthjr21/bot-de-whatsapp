@@ -10,7 +10,7 @@ import { fechaBogota, rangoMes, valida } from './fechas.js';
 // CONFIGURACIÓN
 // =====================================================
 
-export function iniciarApi(usuarioPorDefecto) {
+export function crearServidorApi(usuarioPorDefecto) {
   const token = process.env.API_TOKEN?.trim();
 
   if (!token) {
@@ -35,7 +35,7 @@ export function iniciarApi(usuarioPorDefecto) {
 
   if (
     !Number.isInteger(puerto) ||
-    puerto < 1 ||
+    puerto < 0 ||
     puerto > 65535
   ) {
     console.error('❌ API_PUERTO no es válido.');
@@ -153,19 +153,7 @@ export function iniciarApi(usuarioPorDefecto) {
       // seleccione otra cuenta desde la URL.
       const usuario = usuarioPorDefecto;
 
-      const mes =
-        parametros.get('mes') ??
-        fechaBogota().slice(0, 7);
-
-      if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(mes)) {
-        responder(
-          res,
-          400,
-          { error: 'mes debe tener el formato AAAA-MM' },
-          cabeceras
-        );
-        return;
-      }
+      const mes = parametros.get('mes') ?? fechaBogota().slice(0, 7);
 
       switch (url.pathname) {
         // ---------------------------------------------
@@ -201,6 +189,10 @@ export function iniciarApi(usuarioPorDefecto) {
         // ---------------------------------------------
 
         case '/api/resumen': {
+          if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(mes) || Number(mes.slice(0, 4)) < 1000) {
+            responder(res, 400, { error: 'mes debe tener un año entre 1000 y 9999 y formato AAAA-MM' }, cabeceras);
+            return;
+          }
           const { desde, hasta } = rangoMes(mes);
 
           const resumen = db.resumen(
@@ -244,6 +236,8 @@ export function iniciarApi(usuarioPorDefecto) {
             parametros.get('limite') ?? '100';
 
           const limite = Number(limiteTexto);
+          const offsetTexto = parametros.get('offset') ?? '0';
+          const offset = Number(offsetTexto);
 
           if (
             (desde && !valida(desde)) ||
@@ -304,6 +298,11 @@ export function iniciarApi(usuarioPorDefecto) {
             return;
           }
 
+          if (!Number.isSafeInteger(offset) || offset < 0 || offset > 1_000_000) {
+            responder(res, 400, { error: 'offset debe ser un entero entre 0 y 1000000' }, cabeceras);
+            return;
+          }
+
           if (
             categoria &&
             !CATEGORIAS.includes(categoria)
@@ -324,6 +323,7 @@ export function iniciarApi(usuarioPorDefecto) {
             tipo,
             categoria: categoria ?? undefined,
             limite,
+            offset,
           });
 
           responder(
@@ -340,6 +340,10 @@ export function iniciarApi(usuarioPorDefecto) {
         // ---------------------------------------------
 
         case '/api/presupuestos': {
+          if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(mes) || Number(mes.slice(0, 4)) < 1000) {
+            responder(res, 400, { error: 'mes debe tener un año entre 1000 y 9999 y formato AAAA-MM' }, cabeceras);
+            return;
+          }
           const { desde, hasta } = rangoMes(mes);
 
           const presupuestos = db.presupuestos(usuario).map(
@@ -418,15 +422,18 @@ export function iniciarApi(usuarioPorDefecto) {
     );
   });
 
+  return servidor;
+}
+
+export function iniciarApi(usuarioPorDefecto) {
+  const servidor = crearServidorApi(usuarioPorDefecto);
+  if (!servidor) return null;
+  const puerto = Number(process.env.API_PUERTO ?? 3001);
+  const host = process.env.API_HOST ?? '127.0.0.1';
   servidor.listen(puerto, host, () => {
-    console.log(
-      `✅ API activa en http://${host}:${puerto}`
-    );
-    console.log(
-      `🌐 Origen permitido: ${origenPermitido}`
-    );
+    console.log(`✅ API activa en http://${host}:${servidor.address().port}`);
+    console.log(`🌐 Origen permitido: ${process.env.ORIGEN_PERMITIDO ?? 'http://localhost:3000'}`);
     console.log('🔐 Token de API configurado.');
   });
-
   return servidor;
 }

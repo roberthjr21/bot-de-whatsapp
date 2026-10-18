@@ -1,7 +1,7 @@
 import { CATEGORIAS } from './categorias.js';
  
 // Proveedor de IA: Gemini si hay GEMINI_API_KEY; si no, Claude si hay ANTHROPIC_API_KEY.
-// MODELO_IA elige el modelo (por defecto gemini-2.5-flash o claude-haiku-5-5).
+// MODELO_GEMINI / MODELO_ANTHROPIC eligen cada proveedor; MODELO_IA queda como compatibilidad.
 function proveedor() {
   if (process.env.GEMINI_API_KEY) return 'gemini';
   if (process.env.ANTHROPIC_API_KEY) return 'claude';
@@ -18,7 +18,7 @@ const HERRAMIENTAS = [
       'Registra UN gasto o ingreso. Si la persona cuenta varios, llama a esta herramienta una vez por cada uno.',
     propiedades: {
       tipo: { type: 'string', enum: ['gasto', 'ingreso'] },
-      monto: { type: 'integer', description: 'Monto en pesos colombianos, entero y mayor que 0.' },
+      monto: { type: 'integer', minimum: 1, maximum: 100000000, description: 'Monto en pesos colombianos, entero.' },
       categoria: { type: 'string', enum: CATEGORIAS },
       descripcion: { type: 'string', description: 'Descripción muy corta (2 a 5 palabras).' },
       fecha: { type: 'string', description: 'AAAA-MM-DD. Solo si la persona indicó una fecha distinta de hoy.' },
@@ -41,14 +41,14 @@ const HERRAMIENTAS = [
   },
   {
     nombre: 'deshacer_ultimo',
-    descripcion: 'Borra el último movimiento registrado (cuando la persona dice que se equivocó).',
+    descripcion: 'Solicita confirmación para borrar el último movimiento reciente. No se borra hasta que la persona confirme con /deshacer confirmar.',
   },
   {
     nombre: 'fijar_presupuesto',
     descripcion: 'Fija un límite mensual de gasto para una categoría.',
     propiedades: {
       categoria: { type: 'string', enum: CATEGORIAS },
-      limite_mensual: { type: 'integer', description: 'Límite en pesos colombianos.' },
+      limite_mensual: { type: 'integer', minimum: 1, maximum: 100000000, description: 'Límite mensual entero en COP.' },
     },
     requeridas: ['categoria', 'limite_mensual'],
   },
@@ -63,6 +63,15 @@ const esquema = (h) => ({
   properties: h.propiedades,
   ...(h.requeridas ? { required: h.requeridas } : {}),
 });
+
+async function solicitarConReintento(url, opciones) {
+  let respuesta = await fetch(url, opciones);
+  if (respuesta.status === 429 || respuesta.status >= 500) {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    respuesta = await fetch(url, opciones);
+  }
+  return respuesta;
+}
  
 // Formato de Claude
 const herramientasClaude = () =>
@@ -89,9 +98,10 @@ function instrucciones(hoy) {
 Reglas:
 - Cuando la persona cuente un gasto o un ingreso, usa registrar_movimiento (una llamada por cada movimiento).
 - Convierte siempre los montos a pesos enteros: "20 mil" = 20000, "20 lucas" = 20000, "1,5 millones" = 1500000.
+- La moneda usa el formato colombiano: punto para miles y coma para decimales. No inventes ni adivines montos con separadores ambiguos.
 - Si dice "ayer", "el lunes", etc., calcula la fecha a partir de hoy. Si no dice fecha, no la envíes.
 - Si falta el monto o no se entiende qué pasó, NO registres nada: haz una pregunta corta.
-- Para saber cuánto gastó o ganó usa consultar_resumen; para ver lo último, ultimos_movimientos; para borrar el último registro, deshacer_ultimo; para límites mensuales, fijar_presupuesto o ver_presupuestos.
+- Para saber cuánto gastó o ganó usa consultar_resumen; para ver lo último, ultimos_movimientos; para iniciar un borrado pide confirmación con deshacer_ultimo; para límites mensuales, fijar_presupuesto o ver_presupuestos.
 - Para otras preguntas de dinero (ahorro, deudas, cómo organizarse), responde en texto, breve y práctico. Das información general, no eres asesor financiero: no recomiendes inversiones concretas ni prometas resultados.
 - Responde siempre en español, corto y amable. No inventes datos que la persona no haya dicho.`;
 }
@@ -102,12 +112,12 @@ async function leerError(res) {
 }
  
 async function conGemini(texto, hoy) {
-  const modelo = process.env.MODELO_IA ?? 'gemini-2.5-flash';
+  const modelo = process.env.MODELO_GEMINI ?? process.env.MODELO_IA ?? 'gemini-2.5-flash';
   const url =
     process.env.GEMINI_URL ??
     `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelo)}:generateContent`;
  
-  const res = await fetch(url, {
+  const res = await solicitarConReintento(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
     body: JSON.stringify({
@@ -140,7 +150,7 @@ async function conGemini(texto, hoy) {
  
 async function conClaude(texto, hoy) {
   const url = process.env.ANTHROPIC_URL ?? 'https://api.anthropic.com/v1/messages';
-  const res = await fetch(url, {
+  const res = await solicitarConReintento(url, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -148,7 +158,7 @@ async function conClaude(texto, hoy) {
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify({
-      model: process.env.MODELO_IA ?? 'claude-haiku-5-5',
+      model: process.env.MODELO_ANTHROPIC ?? process.env.MODELO_IA ?? 'claude-haiku-5-5',
       max_tokens: 600,
       system: instrucciones(hoy),
       tools: herramientasClaude(),

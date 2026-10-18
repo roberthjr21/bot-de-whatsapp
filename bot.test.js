@@ -1,19 +1,35 @@
 // Ejecutar con:  npm test      (no usa WhatsApp ni internet: la IA y la base de datos son simuladas)
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import http from 'node:http';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { after } from 'node:test';
+import { DatabaseSync } from 'node:sqlite';
 
-process.env.DB_ARCHIVO = ':memory:';
+const temporal = fs.mkdtempSync(path.join(os.tmpdir(), 'bot-financiero-test-'));
+process.env.DB_ARCHIVO = path.join(temporal, 'pruebas.db');
 process.env.API_TOKEN = 'secreto-de-prueba';
 process.env.API_PUERTO = '0';
 process.env.ANTHROPIC_API_KEY = 'clave-falsa';
+for (const variable of ['GEMINI_API_KEY', 'GEMINI_URL', 'ANTHROPIC_URL', 'MODELO_IA', 'MODELO_GEMINI', 'MODELO_ANTHROPIC']) {
+  delete process.env[variable];
+}
 
 const db = await import('./db.js');
 const { ejecutar } = await import('./acciones.js');
 const { interpretarComando } = await import('./comandos.js');
 const { interpretar } = await import('./ia.js');
-const { iniciarApi } = await import('./api.js');
+const { crearServidorApi } = await import('./api.js');
 const { pesos, rangoPeriodo, rangoMes, valida } = await import('./fechas.js');
+const { parseMonto, tieneDecimalConPunto } = await import('./montos.js');
+const { acotarAcciones } = await import('./politicas.js');
+const { crearRespaldo, restaurarRespaldo } = await import('./db-admin.js');
+
+after(() => {
+  db.cerrarBase();
+  fs.rmSync(temporal, { recursive: true, force: true });
+});
 
 const U = '573001234567';
 const HOY = '2026-10-17'; // sábado
@@ -46,6 +62,32 @@ test('comandos: /gasto, /ingreso y errores', () => {
   assert.match(interpretarComando('/gasto mucho').respuesta, /Usa: \/gasto/);
   assert.equal(interpretarComando('/inventado'), null);
   assert.equal(interpretarComando('/resumen año').acciones[0].datos.periodo, 'anio');
+  assert.equal(interpretarComando('/gasto 20 mil comida almuerzo').acciones[0].datos.monto, 20000);
+  assert.equal(interpretarComando('/gasto 8 lucas bus').acciones[0].datos.monto, 8000);
+  assert.equal(interpretarComando('/gasto 20.5 comida').respuesta.includes('Usa:'), true);
+  assert.equal(interpretarComando('/gasto 99999999999999999999 comida').respuesta.includes('Usa:'), true);
+  assert.equal(parseMonto('1,5'), 2);
+  assert.equal(parseMonto('1,5 millones'), 1500000);
+  assert.equal(parseMonto('20.000'), 20000);
+  assert.equal(parseMonto('20.5'), null);
+  assert.equal(tieneDecimalConPunto('pagué 20.5 por el almuerzo'), true);
+  assert.equal(tieneDecimalConPunto('pagué $20.5 por el almuerzo.'), true);
+  assert.equal(tieneDecimalConPunto('pagué 20.500 por el almuerzo'), false);
+});
+
+test('las acciones tienen límite por mensaje y una sola acción destructiva', () => {
+  const lote = [
+    { nombre: 'deshacer_ultimo' },
+    { nombre: 'deshacer_ultimo' },
+    { nombre: 'consultar_resumen' },
+    { nombre: 'fijar_presupuesto' },
+    { nombre: 'ver_presupuestos' },
+    { nombre: 'ultimos_movimientos' },
+  ];
+  const resultado = acotarAcciones(lote);
+  assert.equal(resultado.length, 4);
+  assert.equal(resultado.filter((a) => a.nombre === 'deshacer_ultimo').length, 1);
+  assert.deepEqual(acotarAcciones(null), []);
 });
 
 test('registrar movimientos y evitar duplicados', () => {
@@ -53,17 +95,20 @@ test('registrar movimientos y evitar duplicados', () => {
   assert.match(r, /Gasto registrado: \$20\.000 en Comida \(almuerzo\)/);
   assert.equal(reg({ tipo: 'gasto', monto: 20000, categoria: 'Comida', descripcion: 'almuerzo' }, 0, 'msg1'), null); // mismo mensaje
   assert.match(reg({ tipo: 'ingreso', monto: 1500000, categoria: 'Salario', descripcion: 'quincena' }, 0, 'msg2'), /Ingreso registrado: \$1\.500\.000/);
-  assert.match(reg({ tipo: 'gasto', monto: 12000, categoria: 'Inventada', descripcion: '' }, 0, 'msg3'), /en Otros/);
+  assert.match(reg({ tipo: 'gasto', monto: 12000, categoria: 'Inventada', descripcion: '' }, 0, 'msg3'), /No entendí/);
   assert.match(reg({ tipo: 'gasto', monto: -5, categoria: 'Comida' }, 0, 'msg4'), /No entendí/);
   assert.match(reg({ tipo: 'gasto', monto: 8000, categoria: 'Transporte', descripcion: 'bus', fecha: '2026-10-15' }, 0, 'msg5'), /2026-10-15/);
   // fecha futura o inválida: se usa la del mensaje
   assert.doesNotMatch(reg({ tipo: 'gasto', monto: 1000, categoria: 'Otros', descripcion: 'x', fecha: '2027-01-01' }, 0, 'msg6'), /2027/);
+  assert.match(reg({ tipo: 'gasto', monto: true, categoria: 'Otros' }, 0, 'msg7'), /No entendí/);
+  assert.match(reg({ tipo: 'gasto', monto: 1e12, categoria: 'Otros' }, 0, 'msg8'), /No entendí/);
+  assert.match(reg({ tipo: 'transferencia', monto: 100, categoria: 'Otros' }, 0, 'msg9'), /No entendí/);
 });
 
 test('resumen del periodo y por categoría', () => {
   const texto = ejecutar({ nombre: 'consultar_resumen', datos: { periodo: 'mes' } }, { usuario: U, hoy: HOY });
   assert.match(texto, /Ingresos: \$1\.500\.000/);
-  assert.match(texto, /Gastos: \$41\.000/); // 20.000 + 12.000 + 8.000 + 1.000
+  assert.match(texto, /Gastos: \$29\.000/); // 20.000 + 8.000 + 1.000; categoría inválida rechazada
   assert.match(texto, /• Comida: \$20\.000/);
   const vacio = ejecutar({ nombre: 'consultar_resumen', datos: { periodo: 'mes_pasado' } }, { usuario: U, hoy: HOY });
   assert.match(vacio, /No tienes movimientos/);
@@ -75,13 +120,36 @@ test('presupuestos con alertas al 80% y al pasarse', () => {
   assert.match(reg({ tipo: 'gasto', monto: 35000, categoria: 'Ocio', descripcion: 'salida' }, 0, 'o2'), /⚠️ Llevas el 85%/);
   assert.match(reg({ tipo: 'gasto', monto: 30000, categoria: 'Ocio', descripcion: 'juego' }, 0, 'o3'), /🚨 Te pasaste/);
   assert.match(ejecutar({ nombre: 'ver_presupuestos', datos: {} }, { usuario: U, hoy: HOY }), /Ocio: \$115\.000 de \$100\.000 \(115%\)/);
+  assert.match(ejecutar({ nombre: 'fijar_presupuesto', datos: { categoria: 'Ocio', limite_mensual: 1e12 } }, { usuario: U, hoy: HOY }), /Dime la categoría/);
 });
 
-test('últimos movimientos y deshacer', () => {
+test('últimos movimientos y deshacer con confirmación', () => {
   const ultimos = ejecutar({ nombre: 'ultimos_movimientos', datos: { cantidad: 2 } }, { usuario: U, hoy: HOY });
   assert.equal(ultimos.split('\n').length, 3);
-  assert.match(ejecutar({ nombre: 'deshacer_ultimo', datos: {} }, { usuario: U, hoy: HOY }), /Borré el último registro/);
-  assert.match(ejecutar({ nombre: 'deshacer_ultimo', datos: {} }, { usuario: 'otro' }), /No tienes movimientos/);
+  assert.match(ejecutar({ nombre: 'deshacer_ultimo', datos: {} }, { usuario: U, hoy: HOY }), /\/deshacer confirmar/);
+  assert.match(ejecutar({ nombre: 'confirmar_deshacer', datos: {} }, { usuario: U, hoy: HOY }), /Borré el movimiento confirmado/);
+  ejecutar({ nombre: 'deshacer_ultimo', datos: {} }, { usuario: U, hoy: HOY });
+  assert.match(ejecutar({ nombre: 'cancelar_deshacer', datos: {} }, { usuario: U, hoy: HOY }), /cancelé/);
+  assert.match(ejecutar({ nombre: 'confirmar_deshacer', datos: {} }, { usuario: U, hoy: HOY }), /No hay un borrado pendiente/);
+  assert.match(ejecutar({ nombre: 'deshacer_ultimo', datos: {} }, { usuario: 'otro' }), /No hay movimientos/);
+});
+
+test('respaldo y restauración conservan datos en WAL sin sobrescribir', () => {
+  const origen = path.join(temporal, 'wal-origen.db');
+  const respaldo = path.join(temporal, 'respaldo.db');
+  const restaurada = path.join(temporal, 'restaurada.db');
+  const origenDb = new DatabaseSync(origen);
+  origenDb.exec('PRAGMA journal_mode=WAL; CREATE TABLE movimientos (id INTEGER PRIMARY KEY, monto INTEGER); CREATE TABLE presupuestos (id INTEGER); CREATE TABLE procesados (id INTEGER);');
+  const insertar = origenDb.prepare('INSERT INTO movimientos (monto) VALUES (?)');
+  for (let i = 1; i <= 100; i++) insertar.run(i);
+  assert.throws(() => restaurarRespaldo(origen, path.join(temporal, 'restauracion-insegura.db')), /WAL\/SHM/);
+  crearRespaldo(origen, respaldo);
+  origenDb.close();
+  restaurarRespaldo(respaldo, restaurada);
+  const restauradaDb = new DatabaseSync(restaurada, { readOnly: true });
+  assert.equal(restauradaDb.prepare('SELECT count(*) AS n FROM movimientos').get().n, 100);
+  restauradaDb.close();
+  assert.throws(() => restaurarRespaldo(respaldo, restaurada), /ya existe/);
 });
 
 test('los datos de cada persona están separados', () => {
@@ -91,71 +159,113 @@ test('los datos de cada persona están separados', () => {
 
 test('IA simulada: interpreta varias herramientas en un mensaje', async () => {
   let recibido;
-  const falsa = http.createServer((req, res) => {
-    let cuerpo = '';
-    req.on('data', (d) => (cuerpo += d));
-    req.on('end', () => {
-      recibido = { cabeceras: req.headers, cuerpo: JSON.parse(cuerpo) };
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, opciones) => {
+    recibido = { cabeceras: opciones.headers, cuerpo: JSON.parse(opciones.body) };
+    return new Response(JSON.stringify({
         content: [
           { type: 'text', text: 'Listo, anoté los dos.' },
           { type: 'tool_use', id: 'a', name: 'registrar_movimiento', input: { tipo: 'gasto', monto: 5000, categoria: 'Transporte', descripcion: 'bus' } },
           { type: 'tool_use', id: 'b', name: 'registrar_movimiento', input: { tipo: 'gasto', monto: 12000, categoria: 'Comida', descripcion: 'almuerzo' } },
         ],
-      }));
-    });
-  });
-  await new Promise((r) => falsa.listen(0, '127.0.0.1', r));
-  process.env.ANTHROPIC_URL = `http://127.0.0.1:${falsa.address().port}/v1/messages`;
-  const { interpretar: interpretarConUrl } = await import('./ia.js?url=falsa');
-  const r = await interpretarConUrl('bus 5 mil y almuerzo 12 mil', HOY);
-  falsa.close();
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  try {
+    const { interpretar: interpretarConUrl } = await import('./ia.js?respuesta-falsa');
+    const r = await interpretarConUrl('bus 5 mil y almuerzo 12 mil', HOY);
 
-  assert.equal(r.acciones.length, 2);
-  assert.equal(r.acciones[1].datos.monto, 12000);
-  assert.equal(r.texto, 'Listo, anoté los dos.');
-  assert.equal(recibido.cabeceras['x-api-key'], 'clave-falsa');
-  assert.equal(recibido.cuerpo.tools.length, 6);
-  assert.match(recibido.cuerpo.system, /Hoy es 2026-10-17/);
-  assert.equal(typeof interpretar, 'function');
+    assert.equal(r.acciones.length, 2);
+    assert.equal(r.acciones[1].datos.monto, 12000);
+    assert.equal(r.texto, 'Listo, anoté los dos.');
+    assert.equal(recibido.cabeceras['x-api-key'], 'clave-falsa');
+    assert.equal(recibido.cuerpo.tools.length, 6);
+    assert.match(recibido.cuerpo.system, /Hoy es 2026-10-17/);
+    assert.equal(typeof interpretar, 'function');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('IA simulada: un error de la API se propaga con un mensaje claro', async () => {
-  const caida = http.createServer((req, res) => { res.writeHead(529); res.end('sobrecargada'); });
-  await new Promise((r) => caida.listen(0, '127.0.0.1', r));
-  process.env.ANTHROPIC_URL = `http://127.0.0.1:${caida.address().port}/v1/messages`;
-  const { interpretar: otra } = await import('./ia.js?url=caida');
-  await assert.rejects(() => otra('hola', HOY), /API 529/);
-  caida.close();
+  const originalFetch = globalThis.fetch;
+  let intentos = 0;
+  globalThis.fetch = async () => { intentos++; return new Response('sobrecargada', { status: 529 }); };
+  try {
+    const { interpretar: otra } = await import('./ia.js?respuesta-caida');
+    await assert.rejects(() => otra('hola', HOY), /API 529/);
+    assert.equal(intentos, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('IA simulada: Gemini usa su modelo y sus herramientas sin salir a internet', async () => {
+  const originalFetch = globalThis.fetch;
+  process.env.GEMINI_API_KEY = 'clave-falsa-gemini';
+  process.env.MODELO_GEMINI = 'modelo-prueba';
+  let recibido;
+  globalThis.fetch = async (url, opciones) => {
+    recibido = { url, opciones };
+    return new Response(JSON.stringify({ candidates: [{ content: { parts: [
+      { functionCall: { name: 'registrar_movimiento', args: { tipo: 'gasto', monto: 8000, categoria: 'Transporte' } } },
+    ] } }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  try {
+    const r = await interpretar('8 lucas en bus', HOY);
+    assert.equal(r.acciones[0].datos.monto, 8000);
+    assert.equal(recibido.opciones.headers['x-goog-api-key'], 'clave-falsa-gemini');
+    assert.match(recibido.url, /modelo-prueba/);
+  } finally {
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.MODELO_GEMINI;
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('API para la página: token, resumen, movimientos y presupuestos', async () => {
-  const servidor = iniciarApi(U);
-  await new Promise((r) => servidor.once('listening', r));
-  const base = `http://127.0.0.1:${servidor.address().port}`;
-  const con = { headers: { Authorization: 'Bearer secreto-de-prueba' } };
+  const servidor = crearServidorApi(U);
+  const solicitar = (url, { method = 'GET', headers = {} } = {}) => {
+    const req = { method, url, headers };
+    const res = {
+      headersSent: false,
+      writeHead(status, cabeceras) { this.statusCode = status; this.headers = cabeceras; this.headersSent = true; },
+      end(body = '') { this.body = body; },
+    };
+    servidor.emit('request', req, res);
+    return { status: res.statusCode, headers: res.headers, json: res.body ? JSON.parse(res.body) : undefined };
+  };
+  const con = { headers: { authorization: 'Bearer secreto-de-prueba' } };
 
-  assert.equal((await fetch(`${base}/api/salud`)).status, 401);
-  assert.equal((await fetch(`${base}/api/salud`, { headers: { Authorization: 'Bearer malo' } })).status, 401);
-  assert.equal((await fetch(`${base}/api/salud`, con)).status, 200);
+  assert.equal(solicitar('/api/salud').status, 401);
+  assert.equal(solicitar('/api/salud', { headers: { authorization: 'Bearer malo' } }).status, 401);
+  assert.equal(solicitar('/api/salud', con).status, 200);
 
-  const resumen = await (await fetch(`${base}/api/resumen?mes=2026-10`, con)).json();
+  const resumen = solicitar('/api/resumen?mes=2026-10', con).json;
   assert.equal(resumen.ingresos, 1500000);
   assert.ok(resumen.gastos > 0 && Array.isArray(resumen.porCategoria));
 
-  const movs = await (await fetch(`${base}/api/movimientos?tipo=gasto&categoria=Ocio`, con)).json();
+  const movs = solicitar('/api/movimientos?tipo=gasto&categoria=Ocio', con).json;
   assert.ok(movs.length >= 2 && movs.every((m) => m.categoria === 'Ocio' && m.tipo === 'gasto'));
 
-  assert.equal((await fetch(`${base}/api/movimientos?desde=ayer`, con)).status, 400);
-  assert.equal((await fetch(`${base}/api/resumen?mes=octubre`, con)).status, 400);
-  assert.equal((await fetch(`${base}/api/nada`, con)).status, 404);
+  assert.equal(solicitar('/api/movimientos?desde=ayer', con).status, 400);
+  assert.equal(solicitar('/api/resumen?mes=octubre', con).status, 400);
+  assert.equal(solicitar('/api/resumen?mes=0000-01', con).status, 400);
+  assert.equal(solicitar('/api/categorias?mes=abc', con).status, 200);
+  assert.equal(solicitar('/api/nada', con).status, 404);
 
-  const presu = await (await fetch(`${base}/api/presupuestos?mes=2026-10`, con)).json();
+  const pagina1 = solicitar('/api/movimientos?limite=1&offset=0', con).json;
+  const pagina2 = solicitar('/api/movimientos?limite=1&offset=1', con).json;
+  assert.equal(pagina1.length, 1);
+  assert.equal(pagina2.length, 1);
+  assert.notEqual(pagina1[0].id, pagina2[0].id);
+  assert.equal(solicitar('/api/movimientos?offset=-1', con).status, 400);
+
+  const presu = solicitar('/api/presupuestos?mes=2026-10', con).json;
   assert.equal(presu[0].categoria, 'Ocio');
 
-  const preflight = await fetch(`${base}/api/resumen`, { method: 'OPTIONS' });
+  const preflight = solicitar('/api/resumen', { method: 'OPTIONS' });
   assert.equal(preflight.status, 204);
-  assert.equal(preflight.headers.get('access-control-allow-origin'), 'http://localhost:3000');
-  servidor.close();
+  assert.equal(preflight.headers['Access-Control-Allow-Origin'], 'http://localhost:3000');
+  assert.equal(solicitar('/api/salud', { method: 'POST', ...con }).status, 405);
+  assert.equal(solicitar('/api/salud', { headers: { ...con.headers, origin: 'https://malicioso.example' } }).status, 403);
 });

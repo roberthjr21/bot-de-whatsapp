@@ -4,6 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 const db = new DatabaseSync(process.env.DB_ARCHIVO ?? 'finanzas.db');
 
 db.exec(`
+  PRAGMA busy_timeout = 5000;
   PRAGMA journal_mode = WAL;
 
   CREATE TABLE IF NOT EXISTS movimientos (
@@ -39,6 +40,7 @@ export function yaProcesado(id) {
 export function marcarProcesado(id) {
   db.prepare('INSERT OR IGNORE INTO procesados (id) VALUES (?)').run(id);
 }
+export function cerrarBase() { db.close(); }
 
 // --- Movimientos ---
 // Devuelve el id nuevo, o null si ese mensaje ya estaba registrado
@@ -52,7 +54,7 @@ export function agregarMovimiento({ usuario, tipo, monto, categoria, descripcion
   return r.changes === 0 ? null : Number(r.lastInsertRowid);
 }
 
-export function listarMovimientos({ usuario, desde, hasta, tipo, categoria, limite = 100 }) {
+export function listarMovimientos({ usuario, desde, hasta, tipo, categoria, limite = 100, offset = 0 }) {
   const condiciones = ['usuario = ?'];
   const params = [usuario];
   if (desde) { condiciones.push('fecha >= ?'); params.push(desde); }
@@ -66,21 +68,29 @@ export function listarMovimientos({ usuario, desde, hasta, tipo, categoria, limi
          FROM movimientos
         WHERE ${condiciones.join(' AND ')}
         ORDER BY fecha DESC, id DESC
-        LIMIT ?`
+        LIMIT ? OFFSET ?`
     )
-    .all(...params);
+    .all(...params, Math.max(0, Number(offset) || 0));
 }
 
-export function borrarUltimo(usuario) {
-  const fila = db
-    .prepare(
-      `SELECT id, tipo, monto, categoria, descripcion, fecha
-         FROM movimientos WHERE usuario = ? ORDER BY id DESC LIMIT 1`
-    )
-    .get(usuario);
+export function ultimoMovimientoBorrable(usuario) {
+  return db.prepare(
+    `SELECT id, tipo, monto, categoria, descripcion, fecha
+       FROM movimientos
+      WHERE usuario = ? AND creado >= datetime('now', '-1 day')
+      ORDER BY id DESC LIMIT 1`,
+  ).get(usuario) ?? null;
+}
+
+export function borrarMovimiento(usuario, id) {
+  const fila = db.prepare(
+    `SELECT id, tipo, monto, categoria, descripcion, fecha
+       FROM movimientos WHERE usuario = ? AND id = ?
+         AND creado >= datetime('now', '-1 day')`,
+  ).get(usuario, id);
   if (!fila) return null;
-  db.prepare('DELETE FROM movimientos WHERE id = ?').run(fila.id);
-  return fila;
+  const resultado = db.prepare('DELETE FROM movimientos WHERE usuario = ? AND id = ?').run(usuario, id);
+  return resultado.changes ? fila : null;
 }
 
 // Totales de ingresos y gastos, y gastos por categoría, entre dos fechas

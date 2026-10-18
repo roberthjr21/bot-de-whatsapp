@@ -1,6 +1,10 @@
 import * as db from './db.js';
 import { CATEGORIAS } from './categorias.js';
 import { pesos, rangoMes, rangoPeriodo, valida } from './fechas.js';
+import { montoValido } from './montos.js';
+
+const confirmacionesBorrado = new Map();
+const CONFIRMACION_MS = 2 * 60 * 1000;
 
 // Aviso cuando un gasto se acerca o pasa el presupuesto mensual de su categoría
 function alertaPresupuesto(usuario, categoria, fecha) {
@@ -30,11 +34,11 @@ export function ejecutar(accion, { usuario, hoy, mensajeId, indice }) {
 
   switch (accion.nombre) {
     case 'registrar_movimiento': {
-      const monto = Math.round(Number(datos.monto));
-      if (!['gasto', 'ingreso'].includes(datos.tipo) || !(monto > 0)) {
+      const monto = datos.monto;
+      if (!['gasto', 'ingreso'].includes(datos.tipo) || !montoValido(monto) || !CATEGORIAS.includes(datos.categoria) || (datos.descripcion !== undefined && typeof datos.descripcion !== 'string')) {
         return '⚠️ No entendí bien ese movimiento. Dime el monto y de qué fue.';
       }
-      const categoria = CATEGORIAS.includes(datos.categoria) ? datos.categoria : 'Otros';
+      const categoria = datos.categoria;
       const descripcion = String(datos.descripcion ?? '').slice(0, 120);
       // Sin fecha, o con una fecha futura o inválida: se usa la del mensaje
       const fecha = valida(datos.fecha) && datos.fecha <= hoy ? datos.fecha : hoy;
@@ -86,13 +90,28 @@ export function ejecutar(accion, { usuario, hoy, mensajeId, indice }) {
     }
 
     case 'deshacer_ultimo': {
-      const fila = db.borrarUltimo(usuario);
-      return fila ? `↩️ Borré el último registro:\n${linea(fila)}` : 'No tienes movimientos para borrar.';
+      const fila = db.ultimoMovimientoBorrable(usuario);
+      if (!fila) return 'No hay movimientos recientes para deshacer.';
+      confirmacionesBorrado.set(usuario, { id: fila.id, vence: Date.now() + CONFIRMACION_MS });
+      return `⚠️ ¿Confirmas borrar este movimiento?\n${linea(fila)}\nResponde /deshacer confirmar. Para cancelar: /deshacer cancelar.`;
+    }
+
+    case 'confirmar_deshacer': {
+      const pendiente = confirmacionesBorrado.get(usuario);
+      confirmacionesBorrado.delete(usuario);
+      if (!pendiente || pendiente.vence < Date.now()) return 'No hay un borrado pendiente. Escribe /deshacer para iniciar uno.';
+      const fila = db.borrarMovimiento(usuario, pendiente.id);
+      return fila ? `↩️ Borré el movimiento confirmado:\n${linea(fila)}` : 'El movimiento cambió o ya no está disponible; no borré nada.';
+    }
+
+    case 'cancelar_deshacer': {
+      const existia = confirmacionesBorrado.delete(usuario);
+      return existia ? 'Listo, cancelé el borrado.' : 'No hay un borrado pendiente.';
     }
 
     case 'fijar_presupuesto': {
-      const limite = Math.round(Number(datos.limite_mensual));
-      if (!CATEGORIAS.includes(datos.categoria) || !(limite > 0)) {
+      const limite = datos.limite_mensual;
+      if (!CATEGORIAS.includes(datos.categoria) || !montoValido(limite)) {
         return '⚠️ Dime la categoría y el monto del presupuesto, por ejemplo: presupuesto de 300 mil en comida.';
       }
       db.fijarPresupuesto(usuario, datos.categoria, limite);

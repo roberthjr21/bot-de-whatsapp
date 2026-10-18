@@ -22,10 +22,16 @@ Tu WhatsApp ──► bot.js (Baileys) ──► ia.js (Claude interpreta)  ─�
 ## Instalación
 ```bash
 cd ~/bot-financiero
-npm install @whiskeysockets/baileys qrcode-terminal pino
+npm ci
 cp .env.example .env
 nano .env        # pon tu número, tu clave y un API_TOKEN largo
 ```
+
+`.env.example` documenta la configuración. `MONTO_MAXIMO` define el máximo COP por movimiento y
+presupuesto (predeterminado: 100000000); `MODELO_GEMINI` y `MODELO_ANTHROPIC` permiten elegir
+modelos distintos. `MODELO_IA` sigue aceptándose por compatibilidad. También existen
+`DEBUG`, `MODO_AUTOCHAT`, `ESPERA_RECONEXION_MS`, `API_HOST`, `API_PUERTO`, `ORIGEN_PERMITIDO`,
+`DB_ARCHIVO`, `GEMINI_URL` y `ANTHROPIC_URL`.
 
 ## Primera ejecución (para vincular WhatsApp)
 ```bash
@@ -43,10 +49,11 @@ cat > ~/.config/systemd/user/bot-financiero.service <<'EOF'
 Description=Bot financiero de WhatsApp
 
 [Service]
-WorkingDirectory=/home/roberth/bot-financiero
-ExecStart=/usr/bin/node --env-file=/home/roberth/bot-financiero/.env /home/roberth/bot-financiero/bot.js
+WorkingDirectory=%h/bot-financiero
+ExecStart=/usr/bin/node --env-file=%h/bot-financiero/.env %h/bot-financiero/bot.js
 Restart=always
 RestartSec=10
+RestartPreventExitStatus=2
 
 [Install]
 WantedBy=default.target
@@ -57,6 +64,11 @@ journalctl --user -u bot-financiero.service -f
 ```
 Ojo: **no ejecutes `npm start` mientras el servicio esté encendido** (dos copias con la misma
 sesión se echan una a otra). Usa `systemctl --user stop bot-financiero.service` antes.
+
+Al recibir `SIGINT` o `SIGTERM`, el bot cierra WhatsApp, la API y SQLite para completar el
+checkpoint de WAL. systemd puede seguir usando `Restart=always`; tras un cierre solicitado el
+servicio se detendrá de forma normal. Si Baileys informa una sesión cerrada o reemplazada, el
+proceso termina con código 2; `RestartPreventExitStatus=2` evita un ciclo de reinicios.
 
 ## Qué entiende
 Texto libre (necesita la clave de IA):
@@ -86,7 +98,7 @@ Todas las peticiones llevan la cabecera `Authorization: Bearer TU_API_TOKEN`.
 | `GET /api/salud` | `{ "ok": true }` |
 | `GET /api/categorias` | Lista de categorías |
 | `GET /api/resumen?mes=2026-10` | `{ mes, desde, hasta, ingresos, gastos, balance, porCategoria: [{categoria, total}] }` |
-| `GET /api/movimientos?desde=&hasta=&tipo=&categoria=&limite=` | `[{ id, tipo, monto, categoria, descripcion, fecha }]` (más recientes primero) |
+| `GET /api/movimientos?desde=&hasta=&tipo=&categoria=&limite=&offset=` | `[{ id, tipo, monto, categoria, descripcion, fecha }]` (más recientes primero; `offset` permite paginar) |
 | `GET /api/presupuestos?mes=2026-10` | `[{ categoria, limite, gastado, porcentaje }]` |
 
 Ejemplo desde tu página (Next.js, en el servidor para no exponer el token en el navegador):
@@ -97,14 +109,45 @@ const res = await fetch('http://127.0.0.1:3001/api/resumen?mes=2026-10', {
 const resumen = await res.json();
 ```
 Los montos son pesos enteros y las fechas vienen como `AAAA-MM-DD` (hora de Bogotá).
+`offset` es un entero entre 0 y 1.000.000. `mes` solo aplica a resumen y presupuestos, con años
+entre 1000 y 9999.
+
+## Respaldo y restauración de SQLite
+
+No copies `finanzas.db` por separado: mientras SQLite está en modo WAL, parte de los datos puede
+estar en `finanzas.db-wal`. Genera respaldos consistentes con `VACUUM INTO`:
+
+```bash
+node db-admin.js backup finanzas.db respaldos/finanzas-$(date +%F-%H%M%S).db
+```
+
+El comando valida integridad y tablas antes y después; no sobrescribe un destino existente. Para
+restaurar, usa una ruta nueva (el comando se niega a sobrescribir):
+
+```bash
+node db-admin.js restore respaldos/finanzas-AAAA-MM-DD-HHMMSS.db finanzas-restaurada.db
+DB_ARCHIVO=finanzas-restaurada.db npm start
+```
+
+La restauración conserva el archivo original. Detén el bot antes de restaurar y comprueba que
+`DB_ARCHIVO` apunta a la ruta restaurada. No subas respaldos a GitHub.
 
 ## Privacidad y límites
-- **Tus mensajes se envían a la API de Anthropic** para interpretarlos (solo el texto de cada
-  mensaje, no tu historial). Si no quieres eso, deja `ANTHROPIC_API_KEY` vacío y usa comandos.
-- **Solo responde a los números de `NUMEROS_PERMITIDOS`.** Si alguien más escribe, el bot lo
-  ignora y deja una línea en el registro con su número.
+- Los montos usan pesos enteros COP y aceptan punto como separador de miles y coma decimal;
+  las fracciones de peso se redondean al entero más cercano y formatos ambiguos como `20.5` se
+  rechazan. El máximo predeterminado es $100.000.000 por movimiento o
+  presupuesto y se puede cambiar con `MONTO_MAXIMO`.
+- `/deshacer` solo muestra el movimiento candidato. Para borrarlo debes enviar `/deshacer confirmar`
+  dentro de dos minutos; `/deshacer cancelar` cancela la solicitud. Solo permite movimientos
+  creados en las últimas 24 horas.
+- **Tus mensajes se envían al proveedor IA configurado** para interpretarlos (solo el texto de
+  cada mensaje, no tu historial): Gemini si hay `GEMINI_API_KEY`; de lo contrario Anthropic si
+  hay `ANTHROPIC_API_KEY`. Sin esas claves solo funcionan los comandos.
+- **Solo responde a los números de `NUMEROS_PERMITIDOS`.** Los remitentes no autorizados se
+  ignoran y solo se registra un contador, sin números telefónicos.
 - Los datos viven en `finanzas.db` (más `finanzas.db-wal` y `-shm` mientras corre). Para un
-  respaldo, detén el bot y copia `finanzas.db`. No subas `.env`, `auth/` ni `*.db` a GitHub.
+  respaldo o restauración, sigue los comandos de la sección anterior. No subas `.env`, `auth/`
+  ni `*.db` a GitHub.
 - Si el bot estuvo apagado, atiende los mensajes de hasta 3 días que WhatsApp le entregue y los
   registra con la fecha en que los escribiste.
 - Es una herramienta de registro y organización. Las respuestas generales no son asesoría
