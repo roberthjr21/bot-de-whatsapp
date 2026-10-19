@@ -69,6 +69,10 @@ test('comandos: /gasto, /ingreso y errores', () => {
   assert.equal(interpretarComando('/gasto 99999999999999999999 comida').respuesta.includes('Usa:'), true);
   assert.equal(parseMonto('1,5'), 2);
   assert.equal(parseMonto('1,5 millones'), 1500000);
+  assert.equal(parseMonto('0,000001 millones'), 1);
+  assert.equal(parseMonto('0,0000005 millones'), 1);
+  assert.equal(parseMonto('0,0000004 millones'), null);
+  assert.equal(parseMonto('2,675'), 3);
   assert.equal(parseMonto('20.000'), 20000);
   assert.equal(parseMonto('20.5'), null);
   assert.equal(tieneDecimalConPunto('pagué 20.5 por el almuerzo'), true);
@@ -201,8 +205,10 @@ test('respaldo y restauración conservan datos en WAL sin sobrescribir', () => {
   for (let i = 1; i <= 100; i++) insertar.run('prueba', 'gasto', i, 'Otros', '2026-01-01');
   assert.throws(() => restaurarRespaldo(origen, path.join(temporal, 'restauracion-insegura.db')), /WAL\/SHM/);
   crearRespaldo(origen, respaldo);
+  assert.equal(fs.statSync(respaldo).mode & 0o777, 0o600);
   origenDb.close();
   restaurarRespaldo(respaldo, restaurada);
+  assert.equal(fs.statSync(restaurada).mode & 0o777, 0o600);
   const restauradaDb = new DatabaseSync(restaurada, { readOnly: true });
   assert.equal(restauradaDb.prepare('SELECT count(*) AS n FROM movimientos').get().n, 100);
   restauradaDb.close();

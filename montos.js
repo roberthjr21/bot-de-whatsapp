@@ -20,31 +20,35 @@ export function tieneDecimalConPunto(texto) {
 // aislado, por ejemplo «20.5», no es un grupo de miles válido y se rechaza.
 export function parseMonto(texto) {
   const entrada = String(texto ?? '').trim().toLowerCase().replace(/^\$/, '');
+  if (entrada.length > 100) return null;
   const coincidencia = entrada.match(
     /^([\d.,]+)\s*(millones?|millón|millon|m|mil|lucas|k)?$/u,
   );
   if (!coincidencia) return null;
 
   const [, numero, sufijo = ''] = coincidencia;
-  let canonico;
+  let entero;
+  let decimales = '';
   if (numero.includes(',')) {
     const partes = numero.split(',');
-    if (partes.length !== 2 || !/^\d{1,2}$/.test(partes[1])) return null;
-    const entero = partes[0];
+    if (partes.length !== 2 || !/^\d{1,12}$/.test(partes[1])) return null;
+    [entero, decimales] = partes;
     const valido = /^\d+$/.test(entero) || /^\d{1,3}(?:\.\d{3})+$/.test(entero);
     if (!valido) return null;
-    canonico = `${entero.replaceAll('.', '')}.${partes[1]}`;
   } else if (numero.includes('.')) {
     if (!/^\d{1,3}(?:\.\d{3})+$/.test(numero)) return null;
-    canonico = numero.replaceAll('.', '');
+    entero = numero;
   } else {
-    canonico = numero;
+    entero = numero;
   }
 
-  const valor = Number(canonico);
   const multiplicador = /^(millones?|millón|millon|m)$/.test(sufijo)
-    ? 1_000_000
-    : /^(mil|lucas|k)$/.test(sufijo) ? 1_000 : 1;
-  const redondeado = Math.round(valor * multiplicador);
-  return montoValido(redondeado) ? redondeado : null;
+    ? 1_000_000n
+    : /^(mil|lucas|k)$/.test(sufijo) ? 1_000n : 1n;
+  const denominador = 10n ** BigInt(decimales.length);
+  const numerador = (BigInt(entero.replaceAll('.', '')) * denominador + BigInt(decimales || '0')) * multiplicador;
+  // Redondeo exacto de decimal, sin errores de precisión binaria de Number.
+  const redondeado = (numerador + denominador / 2n) / denominador;
+  if (redondeado < 1n || redondeado > BigInt(montoMaximo())) return null;
+  return Number(redondeado);
 }

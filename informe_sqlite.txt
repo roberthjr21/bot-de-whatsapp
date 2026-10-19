@@ -66,3 +66,19 @@ ARCHIVOS MODIFICADOS
 - db.js
 
 No se hicieron commits, pushes ni despliegues. No se debe afirmar que SQLite está completamente protegido: las pruebas cubren los escenarios indicados, no todas las posibles fallas externas.
+
+SEGUIMIENTO — 2026-10-18
+
+Se corrigieron tres puntos reportados después de la auditoría:
+
+- montos.js: el análisis decimal ahora usa aritmética entera exacta y redondeo decimal explícito (mitad hacia arriba), sin errores de precisión binaria. Acepta hasta 12 cifras decimales cuando el sufijo (por ejemplo, «millones») produce un monto válido en pesos enteros; los montos resultantes menores de un peso o superiores al máximo siguen rechazándose. Se limita la entrada a 100 caracteres.
+- db-admin.js: los archivos finales de respaldo y restauración se crean con permisos 0600 en sistemas POSIX, independientemente del umask del proceso.
+- bot.test.js: se añadieron casos para cantidades pequeñas derivadas de millones, redondeo decimal y permisos 0600 de los archivos de respaldo/restauración.
+
+VERIFICACIÓN DEL SEGUIMIENTO
+
+- npm test: pasó.
+- node bot.test.js: 19 pruebas aprobadas, 0 fallidas.
+- git diff --check: pasó.
+- No se modificaron datos financieros ni archivos .env. No se publicaron cambios.
+- Este checkout contiene solo el bot/API Node.js; no incluye la aplicación web descrita en el reporte posterior, así que su maqueta, navegación y compilación siguen sin poder revisarse aquí.

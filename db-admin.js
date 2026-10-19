@@ -82,6 +82,7 @@ export function crearRespaldo(origen, destino) {
       // presentes en WAL; no depende de que un checkpoint termine primero.
       const literal = temporal.replaceAll("'", "''");
       db.exec(`VACUUM INTO '${literal}'`);
+      fs.chmodSync(temporal, 0o600);
     } finally {
       db.close();
     }
@@ -110,6 +111,7 @@ export function restaurarRespaldo(origen, destino) {
   const temporal = path.join(path.dirname(dst), `.${path.basename(dst)}.restore-${randomUUID()}.db`);
   try {
     fs.copyFileSync(src, temporal, fs.constants.COPYFILE_EXCL);
+    fs.chmodSync(temporal, 0o600);
     validarBase(temporal);
     fs.linkSync(temporal, dst);
   } finally {
